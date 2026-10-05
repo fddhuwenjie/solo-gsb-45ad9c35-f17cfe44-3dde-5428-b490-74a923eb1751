@@ -46,8 +46,11 @@
   ``observations`` / ``thresholds`` 明细被清空为 NULL，仅保留
   ``batch_id``、序号、``previous_digest``、``digest``、条数、首次受理
   时刻/响应与重放统计。归档目标必须落在同一写事务内核验的
-  ``safe_sequence`` 之内，越界抛 :class:`ArchiveConflict`（409，附当前
-  水位与阻塞消费者）；重复或更小目标幂等。已归档批次仍可按摘要接受同
+  ``safe_sequence`` 之内，且目标范围（归档边界+1 .. 目标）内每个必需
+  消费者的确认记录必须逐批存在（水位是缓存高水位，离线修复丢失确认
+  记录不会使其回落）；越界或确认缺失抛 :class:`ArchiveConflict`
+  （409，附当前水位与阻塞消费者或缺失清单），既不清除明细也不推进
+  归档水位；重复或更小目标幂等。已归档批次仍可按摘要接受同
   载荷重放并累计次数，载荷变化仍返回 409；链头摘要与后续上传不变。
 
 批次提交在单个事务内完成「幂等/链头校验 → 追加记录 → 更新链头」；重放也在
@@ -96,7 +99,9 @@
   ``batch_count`` / ``last_sequence`` / ``head_digest``、``archived_through``
   墓碑边界与墓碑骨架、消费者确认摘要与水位、连续批次判定来源摘要），规范
   SHA-256 重算只针对请求范围内的未归档批次（归档批次只核对保存的摘要与
-  边界）；返回快照上限、``ok`` 与问题清单（``issue_code`` / ``sequence`` /
+  边界）；消费者水位另逐批核对**水位以下、归档边界之后**的确认连续性
+  （水位是缓存高水位，离线修复丢失确认记录不会使其回落），防止水位掩盖
+  确认断档；返回快照上限、``ok`` 与问题清单（``issue_code`` / ``sequence`` /
   ``expected`` / ``actual``），发现问题不改任何数据。
 
 已登记消费者的批次处理租约（避免多个处理进程重复读取同一设备链）：
@@ -1642,13 +1647,49 @@ class Database:
             "lease_bound": status["lease_bound"],
         }
 
+    @staticmethod
+    def _missing_consumer_acks(
+        conn,
+        device_id: str,
+        consumer_ids: list[str],
+        from_sequence: int,
+        to_sequence: int,
+    ) -> list[tuple[str, int]]:
+        """在给定连接（可为写事务中的连接）内找出 ``from_sequence..to_sequence``
+        区间内缺少确认记录的 ``(consumer_id, sequence)`` 对。
+
+        按 ``consumer_ids`` 给定顺序（调用方传登记顺序）、序号升序返回；
+        区间为空或无消费者时返回空列表。
+        """
+        if not consumer_ids or from_sequence > to_sequence:
+            return []
+        rows = conn.execute(
+            "SELECT consumer_id, sequence FROM device_batch_acks "
+            "WHERE device_id = ? AND sequence BETWEEN ? AND ?",
+            (device_id, from_sequence, to_sequence),
+        ).fetchall()
+        acked: dict[str, set[int]] = {}
+        for r in rows:
+            acked.setdefault(r["consumer_id"], set()).add(r["sequence"])
+        missing: list[tuple[str, int]] = []
+        for cid in consumer_ids:
+            have = acked.get(cid, set())
+            for seq in range(from_sequence, to_sequence + 1):
+                if seq not in have:
+                    missing.append((cid, seq))
+        return missing
+
     def archive_device_prefix(self, device_id: str, through_sequence: int) -> tuple[dict, bool]:
         """归档连续前缀 ``1..through_sequence`` 的明细载荷（单事务）。
 
         目标不得越过**同一写事务内**核定的 ``safe_sequence``（全部必需消费者
         都已确认的连续前缀）；越界抛 :class:`ArchiveConflict`（HTTP 409），
         detail 携带当前 ``safe_sequence`` / ``archived_through`` /
-        ``head_sequence`` / ``first_gap`` 与阻塞消费者。归档把目标范围内批次
+        ``head_sequence`` / ``first_gap`` 与阻塞消费者。水位是缓存的连续
+        高水位，离线修复可能丢失水位以下的确认记录而水位未回落；归档前在
+        同一写事务内逐批核对目标范围（归档边界+1 .. 目标）内每个必需消费者
+        的确认记录仍然存在，缺失抛 ``missing_consumer_acks``（409，附缺失的
+        消费者/序号/预期值），既不清除明细也不推进归档水位。归档把目标范围内批次
         的 ``observations`` / ``thresholds`` 清空并置墓碑
         （``status='archived'``、``archived_at``），只保留 ``batch_id``、
         序号、前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与
@@ -1698,6 +1739,45 @@ class Database:
                     head_sequence=head_sequence,
                     first_gap=fields["first_gap"],
                     blocking_consumers=fields["blocking_consumers"],
+                )
+
+            # 水位是缓存的连续高水位：离线修复可能丢失水位以下的确认记录而
+            # 水位未回落（safe_sequence 随之失真）。归档前在同一写事务内逐批
+            # 核对目标范围（归档边界+1 .. 目标）内每个必需消费者的确认记录
+            # 仍然存在；缺失即整体拒绝——既不清除明细也不推进归档水位。
+            # 已归档墓碑（≤ archived_through）不核对：归档之后登记的消费者
+            # 从 archived_through 起步，本就没有这些确认。
+            missing_acks = self._missing_consumer_acks(
+                conn,
+                device_id,
+                [s["consumer_id"] for s in fields["consumers"]],
+                archived_through + 1,
+                through_sequence,
+            )
+            if missing_acks:
+                raise ArchiveConflict(
+                    message=(
+                        f"cannot archive through sequence {through_sequence}: "
+                        f"{len(missing_acks)} required consumer acknowledgment(s) "
+                        f"missing in {archived_through + 1}..{through_sequence} "
+                        f"(first: consumer {missing_acks[0][0]!r}, sequence "
+                        f"{missing_acks[0][1]}); cached watermarks mask the gap — "
+                        "restore the acknowledgments before archiving"
+                    ),
+                    reason="missing_consumer_acks",
+                    requested_through=through_sequence,
+                    safe_sequence=safe_sequence,
+                    archived_through=archived_through,
+                    head_sequence=head_sequence,
+                    missing_acks=[
+                        {
+                            "consumer_id": cid,
+                            "sequence": seq,
+                            "expected": "present",
+                            "actual": "missing",
+                        }
+                        for cid, seq in missing_acks
+                    ],
                 )
 
             # 归档不得清除仍被租约占用的明细：任一 held 租约（含过期但尚未
@@ -3354,7 +3434,9 @@ class Database:
         结构核对覆盖**整条链**（代价低、只读骨架）：序号连续性、
         ``previous_digest`` 链、链游标（``batch_count`` / ``last_sequence`` /
         ``head_digest``）、``archived_through`` 墓碑边界与墓碑骨架、全部
-        消费者确认摘要与水位、全部连续批次判定来源摘要。规范 SHA-256 重算
+        消费者确认摘要与水位（含水位以下、归档边界之后的确认连续性——水位
+        是缓存高水位，离线修复丢失确认记录不会使其回落，逐批核对防止水位
+        掩盖确认断档）、全部连续批次判定来源摘要。规范 SHA-256 重算
         只针对**请求范围内**的未归档批次（归档批次明细已清空，只核对保存的
         摘要经链式引用互相印证及墓碑边界）。
         """
@@ -3643,6 +3725,22 @@ class Database:
                         consumer_id=cid,
                     )
                 )
+            # 水位以下的确认连续性：归档边界（不含）到水位之间的每个未归档
+            # 批次都必须留有该消费者的确认记录。水位是缓存的连续高水位，
+            # 离线修复丢失水位以下的确认记录时水位不会自动回落——逐批核对
+            # 防止水位掩盖确认断档。已归档墓碑（≤ archived_through）不核对：
+            # 归档之后登记的消费者从 archived_through 起步，本就没有这些确认。
+            for s in range(archived_through + 1, min(watermark, head_sequence) + 1):
+                if s not in acked:
+                    issues.append(
+                        _issue(
+                            "ack_missing_below_watermark",
+                            s,
+                            "present",
+                            "missing",
+                            consumer_id=cid,
+                        )
+                    )
 
         # ---- 连续批次判定来源：保存的各批骨架必须与当前批次一致 ----
         source_rows = conn.execute(

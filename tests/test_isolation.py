@@ -571,6 +571,52 @@ def test_release_verification_range_invalid_409(client):
     assert status(client, DEVICE).json()["isolated"] is True
 
 
+def test_release_blocked_by_ack_gap_below_watermark_409(client):
+    """离线修复丢失水位以下的确认记录：解除核验必须报出断档并保持隔离。"""
+    digests = upload_chain(client, DEVICE, 2)
+    register(client, DEVICE, "archiver")
+    ack_all(client, DEVICE, "archiver", digests)
+    # 离线事故：seq1 的确认记录丢失，缓存水位仍为 2（核验前 safe 看似覆盖）
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'archiver' AND sequence = 1",
+        (DEVICE,),
+    )
+    assert isolate(client, DEVICE, "iso-1", 2, digests[1]).status_code == 201
+
+    r = release(client, DEVICE, "rel-1", 1, 2)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "verification_failed"
+    hits = [
+        i for i in detail["issues"]
+        if i["issue_code"] == "ack_missing_below_watermark"
+    ]
+    assert len(hits) == 1
+    assert hits[0]["consumer_id"] == "archiver"
+    assert hits[0]["sequence"] == 1
+    assert hits[0]["expected"] == "present" and hits[0]["actual"] == "missing"
+    # 设备保持隔离：归档仍被挡（device_isolated），事件数不变
+    assert status(client, DEVICE).json()["isolated"] is True
+    assert status(client, DEVICE).json()["event_count"] == 1
+    r = client.post(f"/field-devices/{DEVICE}/archive", json={"through_sequence": 2})
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "device_isolated"
+
+    # 离线补回确认记录后重新核验为 ok，可解除（新幂等键）
+    tamper(
+        client,
+        "INSERT INTO device_batch_acks "
+        "(device_id, consumer_id, sequence, batch_digest, confirmed_at) "
+        "VALUES (?, 'archiver', 1, ?, 1700000000.0)",
+        (DEVICE, digests[0]),
+    )
+    r = release(client, DEVICE, "rel-2", 1, 2)
+    assert r.status_code == 201, r.text
+    assert status(client, DEVICE).json()["isolated"] is False
+
+
 def test_release_blocked_by_outstanding_lease_then_reclaim_and_release(client):
     digests = upload_chain(client, DEVICE, 2)
     register(client, DEVICE, "archiver")

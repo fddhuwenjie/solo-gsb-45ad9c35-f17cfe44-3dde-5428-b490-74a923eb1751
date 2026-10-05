@@ -109,7 +109,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "水位最小值，给出可安全归档的连续前缀。"
             "设备可按 sequence 归档不超过 safe_sequence 的连续前缀：清空观测与"
             "阈值明细、保留摘要/条数/首次受理响应/重放统计为墓碑（archived），"
-            "越界 409 并附当前水位与阻塞消费者，重复目标幂等；已归档批次仍可"
+            "越界 409 并附当前水位与阻塞消费者，重复目标幂等；归档还在同一写"
+            "事务内逐批核对目标范围内各必需消费者的确认记录真实存在（水位是"
+            "缓存高水位，离线修复丢失确认不会使其回落），缺失即 409 且不清除"
+            "明细、不推进归档水位；已归档批次仍可"
             "按摘要重放，新消费者从 archived_through 起步。"
             "草稿上线前可创建回放报告：冻结判定水位，用草稿快照重放水位内服务端"
             "库判定并四分类（unchanged/match_gained/match_lost/winner_changed），"
@@ -123,7 +126,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "设备链一致性核验在单个只读 SQLite 事务内固定快照：逐批重算范围内"
             "未归档批次的规范 SHA-256，核对 previous_digest 链、序号连续性、"
             "batch_count/last_sequence/head_digest、archived_through 墓碑边界、"
-            "消费者确认摘要与水位及连续批次判定来源摘要，返回快照上限、ok 与"
+            "消费者确认摘要与水位及水位以下（归档边界之后）的确认连续性、"
+            "连续批次判定来源摘要，返回快照上限、ok 与"
             "问题清单（issue_code/sequence/expected/actual），发现问题不改数据。"
             "已登记消费者可领取批次处理租约：单事务从其连续水位的下一批起选取"
             "未归档连续区间（至多 20 批、1~3600 秒），保存租约与每批摘要；"
@@ -153,7 +157,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "原结果与现行结果；同键同目标重试返回原采纳结果，改目标或他键"
             "争抢同一原判定 409。"
         ),
-        version="1.13.0",
+        version="1.14.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -654,7 +658,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
         description=(
             "按 through_sequence 归档连续前缀 1..through_sequence：目标不得超过"
             "同一写事务内核验的 safe_sequence，越界返回 409 并附当前 safe_sequence、"
-            "archived_through、首个缺口与阻塞消费者。归档清空目标范围的观测与"
+            "archived_through、首个缺口与阻塞消费者。水位是缓存的连续高水位，"
+            "离线修复可能丢失水位以下的确认记录而水位未回落；归档在同一写事务内"
+            "逐批核对目标范围（归档边界+1 .. 目标）内每个必需消费者的确认记录"
+            "仍然存在，缺失返回 409（missing_consumer_acks，附缺失的消费者/序号/"
+            "预期值），既不清除明细也不推进归档水位。归档清空目标范围的观测与"
             "阈值明细，批次成为墓碑（status=archived），只保留 batch_id、序号、"
             "前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与后续"
             "上传不变。重复或更小目标幂等（HTTP 200，status=already_archived）。"
@@ -1053,7 +1061,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "提交序号范围，服务在单个只读 SQLite 事务内固定快照：逐批重算范围内"
             "未归档批次的规范 SHA-256 并与保存摘要比对，核对 previous_digest 链、"
             "序号连续性、batch_count/last_sequence/head_digest、archived_through "
-            "墓碑边界与墓碑骨架、消费者确认摘要与连续水位、连续批次判定来源摘要；"
+            "墓碑边界与墓碑骨架、消费者确认摘要与连续水位及水位以下（归档边界"
+            "之后）的确认连续性（缓存水位不会因确认记录丢失而回落，逐批核对"
+            "防止水位掩盖确认断档）、连续批次判定来源摘要；"
             "归档批次只核对保存的摘要与边界。返回快照上限、ok 与问题清单"
             "（issue_code/sequence/expected/actual）。并发上传、确认或归档期间"
             "结果来自同一快照；发现问题不改任何数据。设备无批次或范围内缺批次"
