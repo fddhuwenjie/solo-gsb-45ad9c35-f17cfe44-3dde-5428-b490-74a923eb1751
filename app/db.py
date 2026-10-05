@@ -46,8 +46,13 @@
   ``observations`` / ``thresholds`` 明细被清空为 NULL，仅保留
   ``batch_id``、序号、``previous_digest``、``digest``、条数、首次受理
   时刻/响应与重放统计。归档目标必须落在同一写事务内核验的
-  ``safe_sequence`` 之内，越界抛 :class:`ArchiveConflict`（409，附当前
-  水位与阻塞消费者）；重复或更小目标幂等。已归档批次仍可按摘要接受同
+  ``safe_sequence`` 之内；归档前还在同一写事务内逐个核对本次目标区间
+  （archived_through+1..through_sequence）确有每个必需消费者的确认行
+  ——缓存水位可能因离线修复丢失确认行而停在高位、掩盖断档，缺少必需
+  确认时抛 :class:`ArchiveConflict`
+  （``missing_required_acknowledgments``，409，附缺失消费者与序号、
+  预期摘要），既不清空明细也不推进归档水位；重复或更小目标仍幂等。
+  已归档批次仍可按摘要接受同
   载荷重放并累计次数，载荷变化仍返回 409；链头摘要与后续上传不变。
 
 批次提交在单个事务内完成「幂等/链头校验 → 追加记录 → 更新链头」；重放也在
@@ -94,7 +99,11 @@
 - ``verify_chain`` 在**单个只读事务**（``PRAGMA query_only`` 兜底）内固定
   快照：结构核对覆盖整条链（序号连续性、``previous_digest`` 链、链游标
   ``batch_count`` / ``last_sequence`` / ``head_digest``、``archived_through``
-  墓碑边界与墓碑骨架、消费者确认摘要与水位、连续批次判定来源摘要），规范
+  墓碑边界与墓碑骨架、消费者确认摘要与水位、连续批次判定来源摘要；另在
+  同一快照内核对每个消费者从归档边界（不含）到其水位的未归档区间确认
+  连续——水位之内缺少确认行（离线修复丢记录而水位未退）按
+  ``ack_missing`` 逐序号报出，归档之后登记的消费者从
+  ``archived_through`` 起步、先前墓碑不算漏确认），规范
   SHA-256 重算只针对请求范围内的未归档批次（归档批次只核对保存的摘要与
   边界）；返回快照上限、``ok`` 与问题清单（``issue_code`` / ``sequence`` /
   ``expected`` / ``actual``），发现问题不改任何数据。
@@ -1502,26 +1511,6 @@ class Database:
                     (watermark, consumer["id"]),
                 )
 
-            # 在同一事务内基于最新稀疏确认把水位推进至首个缺口：
-            # 从当前水位 + 1 起，连续存在的确认序号逐个越过，遇到缺口即停。
-            # 归档之后登记的消费者水位从 archived_through 起步，其首个缺口
-            # 即归档前缀的下一批；归档区间内无需也无法再逐个确认。
-            watermark = consumer["watermark"]
-            while True:
-                nxt = conn.execute(
-                    "SELECT 1 FROM device_batch_acks "
-                    "WHERE device_id = ? AND consumer_id = ? AND sequence = ?",
-                    (device_id, consumer_id, watermark + 1),
-                ).fetchone()
-                if nxt is None:
-                    break
-                watermark += 1
-            if watermark != consumer["watermark"]:
-                conn.execute(
-                    "UPDATE device_consumers SET watermark = ? WHERE id = ?",
-                    (watermark, consumer["id"]),
-                )
-
             confirmed_at = _iso(now if existing is None else existing["confirmed_at"])
             body = {
                 "status": "confirmed" if created else "duplicate",
@@ -1615,6 +1604,42 @@ class Database:
             "lease_bound": lease_bound,
         }
 
+    @staticmethod
+    def _missing_consumer_acknowledgments(
+        conn, device_id: str, from_sequence: int, to_sequence: int
+    ) -> list[dict]:
+        """列出 ``from_sequence..to_sequence`` 内缺少必需消费者确认的批次。
+
+        在写事务同一快照内核对：目标区间内每个**存在的**批次都必须有每个
+        必需消费者的确认行。离线修复/迁移若丢了未归档区间的确认行，消费者
+        缓存水位仍可能停在高位（``safe_sequence`` 由此被高估），单凭
+        ``through_sequence <= safe_sequence`` 不足以保证明细真被全部处理方
+        确认——故归档落盘前必须显式核对确认行本身。返回每项
+        ``{"sequence", "expected_digest", "consumers": [...]}``（消费者按
+        编号排序）。归档区间（已为墓碑）不在调用范围内，归档之后登记的消费
+        者从 ``archived_through`` 起步，先前墓碑不会被当作漏确认。
+        """
+        rows = conn.execute(
+            "SELECT b.sequence AS sequence, b.digest AS digest, c.consumer_id AS cid "
+            "FROM device_batches b "
+            "JOIN device_consumers c ON c.device_id = b.device_id "
+            "LEFT JOIN device_batch_acks a "
+            "ON a.device_id = b.device_id AND a.consumer_id = c.consumer_id "
+            "AND a.sequence = b.sequence "
+            "WHERE b.device_id = ? AND b.sequence BETWEEN ? AND ? "
+            "AND a.sequence IS NULL "
+            "ORDER BY b.sequence, c.consumer_id",
+            (device_id, from_sequence, to_sequence),
+        ).fetchall()
+        missing: dict[int, dict] = {}
+        for r in rows:
+            item = missing.setdefault(
+                r["sequence"],
+                {"sequence": r["sequence"], "expected_digest": r["digest"], "consumers": []},
+            )
+            item["consumers"].append(r["cid"])
+        return [missing[seq] for seq in sorted(missing)]
+
     def get_archive_status(self, device_id: str) -> dict:
         """设备的多消费者归档状态：各水位、首个缺口、阻塞消费者与归档前缀。"""
         with closing(self._connect()) as conn:
@@ -1648,7 +1673,14 @@ class Database:
         目标不得越过**同一写事务内**核定的 ``safe_sequence``（全部必需消费者
         都已确认的连续前缀）；越界抛 :class:`ArchiveConflict`（HTTP 409），
         detail 携带当前 ``safe_sequence`` / ``archived_through`` /
-        ``head_sequence`` / ``first_gap`` 与阻塞消费者。归档把目标范围内批次
+        ``head_sequence`` / ``first_gap`` 与阻塞消费者。即使目标不越过
+        ``safe_sequence``，本次新归档区间
+        （``archived_through+1..through_sequence``）内每个批次还必须确有
+        **每个必需消费者的确认行**：离线修复/迁移可能丢失未归档区间的确认
+        记录而缓存水位停在高位（``safe_sequence`` 被高估、水位掩盖确认断
+        档），此时抛 ``missing_required_acknowledgments``（HTTP 409，detail
+        附缺失消费者、序号与预期摘要），**既不清空任何明细也不推进
+        archived_through**。归档把目标范围内批次
         的 ``observations`` / ``thresholds`` 清空并置墓碑
         （``status='archived'``、``archived_at``），只保留 ``batch_id``、
         序号、前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与
@@ -1698,6 +1730,37 @@ class Database:
                     head_sequence=head_sequence,
                     first_gap=fields["first_gap"],
                     blocking_consumers=fields["blocking_consumers"],
+                )
+
+            # 必需消费者确认断档闸门：目标范围内（本次新归档、尚未成为墓碑
+            # 的区间）每个批次都必须确有每个必需消费者的确认行。缓存水位可能
+            # 因离线修复丢失确认行而停在高位、掩盖断档，故不能只信
+            # safe_sequence；缺确认时整体拒绝（409），既不清空任何明细也不
+            # 推进 archived_through。
+            missing_acks = self._missing_consumer_acknowledgments(
+                conn, device_id, archived_through + 1, through_sequence
+            )
+            if missing_acks:
+                missing_consumers = sorted(
+                    {cid for item in missing_acks for cid in item["consumers"]}
+                )
+                raise ArchiveConflict(
+                    message=(
+                        f"cannot archive through sequence {through_sequence}: "
+                        f"{len(missing_acks)} batch sequence(s) in the target range lack "
+                        "required consumer acknowledgments (the cached watermarks may mask "
+                        "a confirmation gap after offline repair); refusing to clear "
+                        "payloads or advance archived_through"
+                    ),
+                    reason="missing_required_acknowledgments",
+                    requested_through=through_sequence,
+                    safe_sequence=safe_sequence,
+                    archived_through=archived_through,
+                    head_sequence=head_sequence,
+                    first_gap=fields["first_gap"],
+                    blocking_consumers=fields["blocking_consumers"],
+                    missing_consumers=missing_consumers,
+                    missing_acknowledgments=missing_acks,
                 )
 
             # 归档不得清除仍被租约占用的明细：任一 held 租约（含过期但尚未
@@ -3354,7 +3417,12 @@ class Database:
         结构核对覆盖**整条链**（代价低、只读骨架）：序号连续性、
         ``previous_digest`` 链、链游标（``batch_count`` / ``last_sequence`` /
         ``head_digest``）、``archived_through`` 墓碑边界与墓碑骨架、全部
-        消费者确认摘要与水位、全部连续批次判定来源摘要。规范 SHA-256 重算
+        消费者确认摘要与水位、全部连续批次判定来源摘要。此外在同一快照内
+        核对每个消费者从归档边界（不含）到其水位的**未归档区间确认连续**：
+        水位之内缺少确认行（离线修复丢失确认记录而缓存水位未退、掩盖断档）
+        时按 ``ack_missing`` 逐序号报出缺失消费者、序号与预期摘要；归档
+        之后登记的消费者从 ``archived_through`` 起步，先前墓碑不算漏确认。
+        规范 SHA-256 重算
         只针对**请求范围内**的未归档批次（归档批次明细已清空，只核对保存的
         摘要经链式引用互相印证及墓碑边界）。
         """
@@ -3640,6 +3708,31 @@ class Database:
                         watermark + 1,
                         expected_watermark,
                         watermark,
+                        consumer_id=cid,
+                    )
+                )
+            # 水位的可信度检查：从归档边界（不含）到该消费者水位的每一个
+            # **未归档**序号都必须确有确认记录。水位是从 1（或归档之后登记
+            # 消费者的 archived_through）起逐个越过确认推进的，因此水位之内
+            # 不得存在确认断档；离线修复/迁移若丢了未归档区间的确认行而保留
+            # 水位（水位会掩盖断档：上面的推进重算只从水位之后开始，发现不了
+            # 水位之内的缺口），就在这里逐序号报出。归档区间（≤
+            # archived_through）的墓碑无需确认：归档之后登记的消费者直接从
+            # archived_through 起步，先前墓碑不算漏确认。
+            scan_upper = min(watermark, head_sequence)
+            for seq in range(archived_through + 1, scan_upper + 1):
+                if seq in acked:
+                    continue
+                batch_row = by_seq.get(seq)
+                if batch_row is None:
+                    # 链上缺批次已由 sequence_gap / head 相关检查覆盖，跳过
+                    continue
+                issues.append(
+                    _issue(
+                        "ack_missing",
+                        seq,
+                        batch_row["digest"],
+                        "missing",
                         consumer_id=cid,
                     )
                 )

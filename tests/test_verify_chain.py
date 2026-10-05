@@ -654,6 +654,89 @@ def test_verify_watermark_gap_not_flagged(client):
     assert "watermark_not_advanced" not in issue_codes(body)
 
 
+def test_verify_detects_ack_gap_masked_by_watermark(client):
+    """未归档区间的确认记录离线丢失而水位未退：水位掩盖断档，核验必须报出。
+
+    消费者正常确认 seq1、seq2（水位推进到 2）；离线修复丢失 seq1 的未归档
+    确认行后水位仍是 2，但 1..2 已不连续——verify-chain 不得再报 ok=true。
+    """
+    _, digests = upload_chain(client, DEVICE, 2)
+    register(client, DEVICE, "archiver")
+    register(client, DEVICE, "ml")
+    ack_all(client, DEVICE, "archiver", digests)
+    ack_all(client, DEVICE, "ml", digests)
+    assert client.get(f"/field-devices/{DEVICE}/archive-status").json()["safe_sequence"] == 2
+
+    # 离线事故：archiver 对未归档 seq1 的确认记录丢失，水位仍为 2
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'archiver' AND sequence = 1",
+        (DEVICE,),
+    )
+    st = client.get(f"/field-devices/{DEVICE}/archive-status").json()
+    archiver = next(c for c in st["consumers"] if c["consumer_id"] == "archiver")
+    assert archiver["watermark"] == 2  # 缓存水位掩盖了断档
+    assert st["safe_sequence"] == 2  # 若只信水位，隔离解除与归档都会误放行
+
+    body = verify(client, DEVICE, 1, 2).json()
+    assert body["ok"] is False
+    hits = [i for i in body["issues"] if i["issue_code"] == "ack_missing"]
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit["sequence"] == 1
+    assert hit["consumer_id"] == "archiver"
+    assert hit["expected"] == digests[0]  # 该序号批次的摘要
+    assert hit["actual"] == "missing"
+    # ml 的确认完整：不被误报；seq2 确认仍在也不被误格
+    assert [i for i in hits if i["consumer_id"] == "ml"] == []
+    # 只重放/补齐确认后恢复 ok（确认接口幂等，可直接补回丢失记录）
+    ack(client, DEVICE, "archiver", 1, digests[0])
+    assert verify(client, DEVICE, 1, 2).json()["ok"] is True
+
+
+def test_verify_ack_missing_lists_each_consumer_and_sequence(client):
+    """多个消费者、多个缺失序号时问题清单逐项指出消费者与序号。"""
+    _, digests = upload_chain(client, DEVICE, 3)
+    register(client, DEVICE, "a")
+    register(client, DEVICE, "b")
+    ack_all(client, DEVICE, "a", digests)
+    ack_all(client, DEVICE, "b", digests)
+    # 丢失 a 的 seq1 与 b 的 seq1、seq2（水位仍停在 3）
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks WHERE device_id = ? AND sequence = 1 "
+        "AND consumer_id IN ('a', 'b')",
+        (DEVICE,),
+    )
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks WHERE device_id = ? AND sequence = 2 "
+        "AND consumer_id = 'b'",
+        (DEVICE,),
+    )
+    body = verify(client, DEVICE, 1, 3).json()
+    assert body["ok"] is False
+    hits = {(i["consumer_id"], i["sequence"]) for i in body["issues"]
+            if i["issue_code"] == "ack_missing"}
+    assert hits == {("a", 1), ("b", 1), ("b", 2)}
+
+
+def test_verify_archived_tombstones_not_counted_as_missing_acks(client):
+    """已归档墓碑与归档后登记消费者的起步水位都不算漏确认。"""
+    _, digests = upload_chain(client, DEVICE, 4)
+    register(client, DEVICE, "early")
+    ack_all(client, DEVICE, "early", digests)
+    assert archive(client, DEVICE, 2).status_code == 201
+    # 归档后登记的消费者从 archived_through=2 起步：1..2 墓碑无需确认
+    register(client, DEVICE, "late")
+    ack(client, DEVICE, "late", 3, digests[2])
+    ack(client, DEVICE, "late", 4, digests[3])
+    body = verify(client, DEVICE, 1, 4).json()
+    assert body["ok"] is True
+    assert "ack_missing" not in issue_codes(body)
+
+
 # ---------------- 连续批次判定来源摘要 ----------------
 
 

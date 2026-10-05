@@ -44,12 +44,16 @@
 
 设备可调用 `POST /field-devices/{device_id}/archive` 按 `through_sequence`
 归档**连续前缀**：目标不得超过同一写事务内核验的 `safe_sequence`，越界返回
-409 并附当前水位与阻塞消费者。归档清空目标范围批次的观测与阈值明细，批次成为
+409 并附当前水位与阻塞消费者；即使目标不超过 `safe_sequence`，本次新归档区间
+（`archived_through+1..through_sequence`）内每个批次还必须确有**每个必需消费者
+的确认行**——离线修复可能丢失未归档确认记录而缓存水位停在高位（水位掩盖确认
+断档），此时返回 409（`missing_required_acknowledgments`，附缺失消费者、序号与
+预期摘要），**既不清空任何明细也不推进归档水位**。归档清空目标范围批次的观测与阈值明细，批次成为
 **墓碑**（`status=archived`），只保留 `batch_id`、序号、前序/本批摘要、条数、
 首次受理时刻/响应与重放统计；链头摘要与后续上传不变。重复或更小目标幂等，
 `archived_through` 只进不退。已归档批次仍可按摘要接受**同载荷重放**并累计重放
 次数（载荷变化仍 409）；归档之后登记的新消费者从 `archived_through` 起步，
-其首个缺口直接指向归档前缀的下一批。
+其首个缺口直接指向归档前缀的下一批，先前墓碑不要求补确认。
 
 已登记消费者可领取**批次处理租约**（`POST …/batch-leases`）：请求提交
 `consumer_id`、至多 20 个批次的 `max_batches`、1～3600 秒的
@@ -100,7 +104,11 @@
 内固定快照，逐批重算范围内未归档批次的规范 SHA-256 并与保存摘要比对，核对
 `previous_digest` 链、序号连续性、`batch_count`/`last_sequence`/`head_digest`、
 `archived_through` 墓碑边界、消费者确认摘要与连续水位，以及连续批次判定
-（`batch_judgment_batches`）保存的来源摘要；归档批次只核对保存的摘要与边界。
+（`batch_judgment_batches`）保存的来源摘要；并在**同一快照**内核对每个消费者
+从归档边界（`archived_through`，不含）到其水位的**未归档区间确认连续**——
+离线修复若丢失未归档确认记录而缓存水位未退（水位会掩盖确认断档），按
+`ack_missing` 逐序号指出缺失的消费者、序号与预期批次摘要；归档之后登记的消费者
+从 `archived_through` 起步，先前墓碑不算漏确认。归档批次只核对保存的摘要与边界。
 返回快照上限、`ok` 与问题清单（`issue_code`/`sequence`/`expected`/`actual`）；
 并发上传、确认或归档期间结果来自同一快照，核验**不修改任何数据**。
 
@@ -172,7 +180,7 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `POST` | `/field-devices/{device_id}/consumers` | 登记设备的必需下游消费者（不可删除；重复登记幂等；归档后登记从 `archived_through` 起步） |
 | `POST` | `/field-devices/{device_id}/acknowledgments` | 消费者确认已处理批次（`consumer_id`/`sequence`/`batch_digest`；乱序/并发/重复安全，冲突 409） |
 | `GET` | `/field-devices/{device_id}/archive-status` | 查询安全归档水位：`safe_sequence`、`archived_through`、首个缺口、各消费者水位与阻塞消费者 |
-| `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence` 且不侵犯在持租约，越界 409；重复/更小目标幂等） |
+| `POST` | `/field-devices/{device_id}/archive` | 归档连续前缀：清空 `sequence ≤ through_sequence` 的明细载荷（目标须 ≤ 同事务 `safe_sequence` 且不侵犯在持租约，越界 409；本次新归档区间缺任一必需消费者确认行也 409，不清明细、不推归档水位；重复/更小目标幂等） |
 | `POST` | `/field-devices/{device_id}/batch-leases` | 领取批次处理租约（`consumer_id`/`max_batches≤20`/`lease_duration_seconds 1~3600`/幂等键；单从未归档连续区间选批并保存每批摘要；同键重试 200、他键或过期 409） |
 | `GET` | `/field-devices/{device_id}/batch-leases` | 分页查询租约摘要（`after_id` 游标，可按 `consumer_id` 与 `status=held/expired/completed/revoked` 过滤） |
 | `GET` | `/field-devices/{device_id}/batch-leases/{id}` | 查询单条租约详情（状态、起止序号与逐批摘要、观测明细） |
@@ -185,7 +193,7 @@ SQLite 数据通过命名卷 `navlight-data` 持久化。
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}/review-reports` | 分页查询一次判定的复核报告（`after_id` 游标 + `limit`，摘要） |
 | `GET` | `/field-devices/{device_id}/batch-judgments/{id}/review-reports/{rid}` | 查询单份复核报告详情（问题清单、差异字段与原/新候选证据） |
 | `POST` | `/field-devices/{device_id}/batch-judgments/{id}/adoptions` | 采纳 changed 复核报告的新判定为现行结果（幂等键 + 报告 ID；单事务重核来源并重跑核对，替代判定落 `judgments`；重试 200，改目标/他键争抢/来源变化/结果不一致 409） |
-| `POST` | `/field-devices/{device_id}/verify-chain` | 核验设备批次链一致性（只读快照：重算范围内未归档批次摘要，核对链式引用/序号连续性/链游标/墓碑边界/消费者确认与水位/判定来源摘要；不改数据，空设备或缺批次 404） |
+| `POST` | `/field-devices/{device_id}/verify-chain` | 核验设备批次链一致性（只读快照：重算范围内未归档批次摘要，核对链式引用/序号连续性/链游标/墓碑边界/消费者确认与水位（含归档边界到各消费者水位的确认连续性，断档报 ack_missing）/判定来源摘要；不改数据，空设备或缺批次 404） |
 | `POST` | `/field-devices/{device_id}/isolation` | 隔离设备（提交当前链头序号/摘要 + 原因 + 幂等键；同事务核对链头并记录不可变事件；隔离期间上传/确认/归档/租约领取与完成/批次判定 409；同键重试 200，链头不符或已隔离 409） |
 | `POST` | `/field-devices/{device_id}/isolation/release` | 解除隔离（提交核验范围 + 幂等键；同事务核对链头未变、范围核验 ok、无未完成租约，全部通过记录解除事件并恢复原流程；任一不满足 409 整体拒绝） |
 | `GET` | `/field-devices/{device_id}/isolation` | 查询设备隔离状态（是否隔离中、生效中的隔离事件、最近事件与事件总数） |
@@ -788,20 +796,34 @@ curl -s -X POST $DEV/archive -H 'Content-Type: application/json' \
   链头摘要、`batch_count` 与后续上传完全不变；
 - **越界冲突（409）**：`through_sequence` 不得超过**同一写事务内**核定的
   `safe_sequence`。越界返回 409，`detail` 给出当前水位与阻塞消费者，作业
-  应等阻塞消费者追平后重试同一目标：
+  应等阻塞消费者追平后重试同一目标；
+- **必需消费者确认断档（409）**：即使目标不超过 `safe_sequence`，本次新归档
+  区间（`archived_through+1..through_sequence`）内每个批次也必须确有**每个
+  必需消费者的确认行**。设备离线修复或数据库迁移可能丢失未归档区间的确认
+  记录，而消费者缓存水位（以及由其最小值推出的 `safe_sequence`）停在高位、
+  **掩盖确认断档**；此时归档在原写事务内返回 409
+  （`reason=missing_required_acknowledgments`），`detail` 给出缺失的消费者、
+  逐序号预期摘要与当前水位，**既不清空任何批次明细也不推进
+  `archived_through`**。运维按问题清单补齐消费者确认（确认接口本身幂等，
+  重试安全）后重新归档即可；已归档墓碑不在核对范围内，先前墓碑的确认丢失
+  不影响后续归档。响应示例：
 
 ```json
 {
   "detail": {
     "error": "archive_conflict",
-    "reason": "beyond_safe_sequence",
-    "message": "cannot archive through sequence 3: it exceeds safe_sequence 1 …",
-    "requested_through": 3,
-    "safe_sequence": 1,
+    "reason": "missing_required_acknowledgments",
+    "message": "cannot archive through sequence 2: 1 batch sequence(s) in the target range lack required consumer acknowledgments (the cached watermarks may mask a confirmation gap after offline repair); refusing to clear payloads or advance archived_through",
+    "requested_through": 2,
+    "safe_sequence": 2,
     "archived_through": 0,
     "head_sequence": 2,
-    "first_gap": 2,
-    "blocking_consumers": ["ml-pipeline"]
+    "first_gap": 1,
+    "blocking_consumers": [],
+    "missing_consumers": ["ml-pipeline"],
+    "missing_acknowledgments": [
+      {"sequence": 1, "expected_digest": "49740fb7…", "consumers": ["ml-pipeline"]}
+    ]
   }
 }
 ```
@@ -1463,7 +1485,12 @@ curl -s -X POST $DEV/verify-chain \
   清空、状态一致），其后必须不是墓碑；
 - **消费者**：每条确认保存的 `batch_digest` 必须等于该批次当前摘要；水位
   不得越过链头、不得低于 `archived_through`，且必须已按稀疏确认推进到
-  首个缺口（乱序确认形成的合法缺口不报问题）；
+  首个缺口（乱序确认形成的合法缺口不报问题）；此外，在同一快照内核对每个
+  消费者从归档边界（`archived_through`，不含）到其水位的**未归档区间确认
+  连续**——水位之内缺少确认行（离线修复/迁移丢记录而缓存水位未退，水位
+  本身会掩盖断档）按 `ack_missing` 逐序号报出缺失消费者、序号与预期批次
+  摘要。归档区间（≤ `archived_through`）的墓碑无需确认：归档之后登记的
+  消费者直接从 `archived_through` 起步，先前墓碑不算漏确认；
 - **连续批次判定来源**：`batch_judgment_batches` 保存的各批
   `digest` / `previous_digest` / `batch_id` / `observation_count` 必须与
   当前批次一致。
@@ -1503,9 +1530,48 @@ curl -s -X POST $DEV/verify-chain \
 | `archived_through_beyond_head` | 归档水位越过链头 |
 | `tombstone_boundary_violation` | 批次归档状态与 `archived_through` 边界不符 |
 | `tombstone_status_mismatch` / `tombstone_details_present` | 墓碑骨架不一致：状态列与归档时刻矛盾 / 明细未清空 |
-| `ack_digest_mismatch` / `ack_batch_missing` | 确认摘要与批次当前摘要不符 / 确认指向不存在的批次 |
+| `ack_digest_mismatch` / `ack_batch_missing` / `ack_missing` | 确认摘要与批次当前摘要不符 / 确认指向不存在的批次 / 未归档区间内消费者水位覆盖的序号缺少确认行（水位掩盖的确认断档；附 `consumer_id`，`expected` 为该批次摘要） |
 | `watermark_beyond_head` / `watermark_below_archived_through` / `watermark_not_advanced` | 水位越过链头 / 低于归档水位 / 未按稀疏确认推进到首个缺口 |
 | `judgment_source_digest_mismatch` 等 | 连续批次判定来源保存的摘要（或 `previous_digest`/`batch_id`/`observation_count`）与当前批次不一致；来源批次缺失为 `judgment_source_batch_missing` |
+
+**确认断档示例（设备确认水位掩盖确认断档）**：两个消费者都确认了第 1、2 批
+（`safe_sequence=2`）；离线修复过程中未归档的第 1 批确认记录丢失，而消费者
+缓存水位仍是 2。此时若只看水位会误以为两批都已处理完毕：
+
+```bash
+DEV=http://localhost:8000/field-devices/dev-01
+curl -s -X POST $DEV/verify-chain \
+  -H 'Content-Type: application/json' \
+  -d '{"from_sequence": 1, "to_sequence": 2}' | python3 -m json.tool
+```
+
+```json
+{
+  "ok": false,
+  "issue_count": 1,
+  "issues": [
+    {"issue_code": "ack_missing", "sequence": 1,
+     "expected": "49740fb763c71461617735f601caeb89cc114aabc76e5dcd79ec05045767016a",
+     "actual": "missing", "consumer_id": "ml-pipeline"}
+  ],
+  "snapshot": {"head_sequence": 2, "archived_through": 0,
+               "safe_sequence": 2, "consumer_count": 2, "…": "…"}
+}
+```
+
+注意 `snapshot.safe_sequence` 仍为 2——问题出在缓存水位掩盖了确认断档，
+`ack_missing` 直接给出缺失的消费者（`ml-pipeline`）、序号（`1`）与该批次的
+预期摘要。此时：
+
+- **解除隔离会被拒绝**：`POST …/isolation/release` 在同一写事务内重放同一
+  核验，遇 `ack_missing` 返回 `409 verification_failed` 并附上述问题清单，
+  设备保持隔离（不会误放行）；
+- **归档会被拒绝**：`POST …/archive` 在原写事务内核对本次目标区间的确认行，
+  返回 `409 missing_required_acknowledgments`（见 §8），两批明细都不会被
+  清空、`archived_through` 不推进；
+- **修复方式**：按问题清单让缺失消费者用正确摘要重新确认第 1 批（确认接口
+  幂等，网络重试安全），再核验至 `ok=true` 即可解除隔离并归档。归档之后才
+  登记的消费者从 `archived_through` 起步，先前墓碑不会出现在这份清单里。
 
 **错误响应（4xx）**：
 
@@ -1624,7 +1690,9 @@ curl -s "$DEV/isolation/events?limit=50" | python3 -m json.tool
 2. **范围核验为 ok**：对 `from_sequence..to_sequence` 执行与
    `verify-chain` 完全相同的只读核验；范围缺批次
    `409 verification_range_invalid`，核验非 ok `409 verification_failed`
-   并附完整问题清单（设备无批次时空链视为 ok，跳过范围核验）；
+   并附完整问题清单（含消费者水位掩盖的确认断档 `ack_missing`——设备确认
+   了第 1、2 批但未归档的第 1 批确认记录丢失时，即使缓存水位仍为 2 也拒绝
+   放行；设备无批次时空链视为 ok，跳过范围核验）；
 3. **无未完成租约**：设备上不得有 `held` 租约（含过期未回收），否则
    `409 leases_outstanding` 附租约清单——过期租约可在隔离期间显式回收
    （`…/recover`）后重试解除。
@@ -1726,7 +1794,7 @@ t_obs ≈ (1 + drift) · T_true + c
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 判定复核报告 + 复核新判定采纳 + 链一致性核验 + 异常隔离共 258 例）
+pytest                       # 运行测试（算法 + 巡检分配 + API + 批次链 + 多消费者确认 + 前缀归档 + 消费者批次处理租约 + 草稿回放 + 连续批次判定 + 判定复核报告 + 复核新判定采纳 + 链一致性核验 + 异常隔离共 266 例）
 uvicorn app.main:app --reload   # 本地起服务，默认使用 ./data/navlight.db
 ```
 

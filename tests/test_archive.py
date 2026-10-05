@@ -9,6 +9,7 @@ archived_through 起步（首个缺口指向下一批）、并发确认/登记/�
 """
 import os
 import sys
+import sqlite3
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -96,6 +97,17 @@ def detail(client, device, seq):
     return client.get(f"/field-devices/{device}/batches/{seq}")
 
 
+def tamper(client, sql, params=()):
+    """直接改库模拟离线修复丢失确认记录；归档闸门必须在写事务内挡住。"""
+    conn = sqlite3.connect(client.app.state.db._path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------- 前置校验：目标不得越过 safe_sequence ----------------
 
 
@@ -161,6 +173,132 @@ def test_archive_beyond_chain_head_is_safe_violation(client):
 def test_archive_validation_rejects_non_positive(client):
     assert archive(client, DEVICE, 0).status_code == 422
     assert archive(client, DEVICE, -3).status_code == 422
+
+
+# ---------------- 确认断档闸门：水位掩盖缺失确认时拒绝归档 ----------------
+
+
+def test_archive_rejected_when_required_ack_lost_but_watermark_high(client):
+    """离线修复丢失未归档确认行而水位未退：归档必须 409，不清明细、不推水位。"""
+    _, digests = upload_chain(client, DEVICE, 2)
+    register(client, DEVICE, "archiver")
+    register(client, DEVICE, "ml")
+    ack_all(client, DEVICE, "archiver", digests)
+    ack_all(client, DEVICE, "ml", digests)
+    assert status(client, DEVICE)["safe_sequence"] == 2
+
+    # 离线事故：ml 对未归档 seq1 的确认记录丢失，缓存水位仍为 2
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'ml' AND sequence = 1",
+        (DEVICE,),
+    )
+    st = status(client, DEVICE)
+    assert st["safe_sequence"] == 2  # 只信水位会误放行
+    assert st["archived_through"] == 0
+
+    r = archive(client, DEVICE, 2)
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["error"] == "archive_conflict"
+    assert d["reason"] == "missing_required_acknowledgments"
+    assert d["requested_through"] == 2
+    assert d["safe_sequence"] == 2 and d["archived_through"] == 0
+    assert d["missing_consumers"] == ["ml"]
+    assert d["missing_acknowledgments"] == [
+        {"sequence": 1, "expected_digest": digests[0], "consumers": ["ml"]}
+    ]
+
+    # 既不清除明细也不推进归档水位
+    st = status(client, DEVICE)
+    assert st["archived_through"] == 0 and st["archived_at"] is None
+    d1 = detail(client, DEVICE, 1).json()
+    assert d1["status"] == "accepted" and d1["archived"] is False
+    assert d1["observations"] is not None and d1["thresholds"] == THRESHOLDS
+    d2 = detail(client, DEVICE, 2).json()
+    assert d2["status"] == "accepted" and d2["observations"] is not None
+
+    # 幂等补回丢失的确认（重试安全）后归档成功
+    rr = ack(client, DEVICE, "ml", 1, digests[0])
+    assert rr.status_code == 201, rr.text
+    r = archive(client, DEVICE, 2)
+    assert r.status_code == 201
+    assert r.json()["archived_through"] == 2
+    assert detail(client, DEVICE, 1).json()["status"] == "archived"
+
+
+def test_archive_gate_checks_only_newly_archived_range(client):
+    """已归档墓碑不要求确认行；扩大前缀时只核对新落入区间的批次。"""
+    _, digests = upload_chain(client, DEVICE, 4)
+    register(client, DEVICE, "a")
+    ack_all(client, DEVICE, "a", digests)
+    assert archive(client, DEVICE, 2).status_code == 201
+
+    # 离线事故丢失已归档 seq1 的确认行：不影响后续归档（墓碑不核对确认）
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'a' AND sequence = 1",
+        (DEVICE,),
+    )
+    # 但未归档的 seq3 确认丢失 → 扩大到 4 被挡，问题只报 seq3
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'a' AND sequence = 3",
+        (DEVICE,),
+    )
+    r = archive(client, DEVICE, 4)
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["reason"] == "missing_required_acknowledgments"
+    assert d["missing_consumers"] == ["a"]
+    assert [m["sequence"] for m in d["missing_acknowledgments"]] == [3]
+    # 已有墓碑与归档水位不变；seq3/4 明细仍在
+    assert status(client, DEVICE)["archived_through"] == 2
+    assert detail(client, DEVICE, 1).json()["status"] == "archived"
+    assert detail(client, DEVICE, 3).json()["observations"] is not None
+
+    ack(client, DEVICE, "a", 3, digests[2])
+    r = archive(client, DEVICE, 4)
+    assert r.status_code == 201 and r.json()["archived_through"] == 4
+
+
+def test_archive_gate_idempotent_for_already_archived_target(client):
+    """重复/更小目标即使确认行丢失也仍幂等（不重新核对已归档区间）。"""
+    _, digests = upload_chain(client, DEVICE, 2)
+    register(client, DEVICE, "a")
+    ack_all(client, DEVICE, "a", digests)
+    assert archive(client, DEVICE, 2).status_code == 201
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'a' AND sequence IN (1, 2)",
+        (DEVICE,),
+    )
+    r = archive(client, DEVICE, 1)
+    assert r.status_code == 200
+    assert r.json()["status"] == "already_archived"
+    assert r.json()["archived_through"] == 2
+
+
+def test_archive_gate_lists_multiple_consumers_per_sequence(client):
+    _, digests = upload_chain(client, DEVICE, 1)
+    register(client, DEVICE, "a")
+    register(client, DEVICE, "b")
+    ack_all(client, DEVICE, "a", digests)
+    ack_all(client, DEVICE, "b", digests)
+    tamper(client, "DELETE FROM device_batch_acks WHERE device_id = ?", (DEVICE,))
+    r = archive(client, DEVICE, 1)
+    assert r.status_code == 409
+    d = r.json()["detail"]
+    assert d["reason"] == "missing_required_acknowledgments"
+    assert d["missing_consumers"] == ["a", "b"]
+    assert d["missing_acknowledgments"] == [
+        {"sequence": 1, "expected_digest": digests[0], "consumers": ["a", "b"]}
+    ]
+    assert detail(client, DEVICE, 1).json()["observations"] is not None
 
 
 # ---------------- 归档执行：墓碑骨架 ----------------

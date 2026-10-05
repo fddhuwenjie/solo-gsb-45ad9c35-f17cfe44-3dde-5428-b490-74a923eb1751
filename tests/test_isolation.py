@@ -560,6 +560,60 @@ def test_release_verification_failed_409(client):
     assert release(client, DEVICE, "rel-2", 1, 3).status_code == 201
 
 
+def test_release_blocked_by_ack_gap_masked_by_watermark(client):
+    """水位掩盖未归档确认断档：解除必须 409 verification_failed 并保持隔离。"""
+    digests = upload_chain(client, DEVICE, 2)
+    register(client, DEVICE, "archiver")
+    ack_all(client, DEVICE, "archiver", digests)
+    assert isolate(client, DEVICE, "iso-1", 2, digests[1]).status_code == 201
+
+    # 隔离期间的离线修复丢失了未归档 seq1 的确认行，缓存水位仍是 2
+    tamper(
+        client,
+        "DELETE FROM device_batch_acks "
+        "WHERE device_id = ? AND consumer_id = 'archiver' AND sequence = 1",
+        (DEVICE,),
+    )
+    r = release(client, DEVICE, "rel-1", 1, 2)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["reason"] == "verification_failed"
+    hits = [i for i in detail["issues"] if i["issue_code"] == "ack_missing"]
+    assert len(hits) == 1
+    assert hits[0]["sequence"] == 1
+    assert hits[0]["consumer_id"] == "archiver"
+    assert hits[0]["expected"] == digests[0]
+    assert hits[0]["actual"] == "missing"
+    # 设备保持隔离：归档仍被挡（且归档自身也挡住该断档）
+    assert status(client, DEVICE).json()["isolated"] is True
+    ar = client.post(
+        f"/field-devices/{DEVICE}/archive", json={"through_sequence": 2}
+    )
+    assert ar.status_code == 409
+    assert ar.json()["detail"]["error"] == "device_isolated"
+
+    # 幂等补回确认后核验 ok，解除成功
+    pr = client.post(
+        f"/field-devices/{DEVICE}/acknowledgments",
+        json={"consumer_id": "archiver", "sequence": 1, "batch_digest": digests[0]},
+    )
+    # 隔离期间确认接口被闸门挡住：改为直接恢复确认记录模拟离线修复完成
+    assert pr.status_code == 409 and pr.json()["detail"]["error"] == "device_isolated"
+    conn = sqlite3.connect(client.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO device_batch_acks "
+            "(device_id, consumer_id, sequence, batch_digest, confirmed_at) "
+            "VALUES (?, 'archiver', 1, ?, 1700000000.0)",
+            (DEVICE, digests[0]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert release(client, DEVICE, "rel-2", 1, 2).status_code == 201
+    assert status(client, DEVICE).json()["isolated"] is False
+
+
 def test_release_verification_range_invalid_409(client):
     digests = upload_chain(client, DEVICE, 2)
     assert isolate(client, DEVICE, "iso-1", 2, digests[1]).status_code == 201

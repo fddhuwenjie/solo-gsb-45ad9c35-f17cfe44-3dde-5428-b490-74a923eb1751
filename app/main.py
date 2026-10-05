@@ -123,8 +123,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "设备链一致性核验在单个只读 SQLite 事务内固定快照：逐批重算范围内"
             "未归档批次的规范 SHA-256，核对 previous_digest 链、序号连续性、"
             "batch_count/last_sequence/head_digest、archived_through 墓碑边界、"
-            "消费者确认摘要与水位及连续批次判定来源摘要，返回快照上限、ok 与"
-            "问题清单（issue_code/sequence/expected/actual），发现问题不改数据。"
+            "消费者确认摘要与水位及连续批次判定来源摘要，并在同一快照内核对"
+            "各消费者从归档边界到其水位的未归档区间确认连续（确认记录丢失而"
+            "水位未退的断档按 ack_missing 指出缺失消费者、序号与预期摘要；"
+            "归档后登记的消费者从 archived_through 起步，先前墓碑不算漏确认），"
+            "返回快照上限、ok 与问题清单（issue_code/sequence/expected/actual），"
+            "发现问题不改数据。"
             "已登记消费者可领取批次处理租约：单事务从其连续水位的下一批起选取"
             "未归档连续区间（至多 20 批、1~3600 秒），保存租约与每批摘要；"
             "同消费者持约期间同键重试返回原租约、他键 409，区间不会分给两个"
@@ -153,7 +157,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "原结果与现行结果；同键同目标重试返回原采纳结果，改目标或他键"
             "争抢同一原判定 409。"
         ),
-        version="1.13.0",
+        version="1.14.0",
     )
     app.state.db = Database(db_path or config.db_path())
 
@@ -654,7 +658,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
         description=(
             "按 through_sequence 归档连续前缀 1..through_sequence：目标不得超过"
             "同一写事务内核验的 safe_sequence，越界返回 409 并附当前 safe_sequence、"
-            "archived_through、首个缺口与阻塞消费者。归档清空目标范围的观测与"
+            "archived_through、首个缺口与阻塞消费者。即使目标不超过 safe_sequence，"
+            "本次新归档区间内每个批次还必须确有每个必需消费者的确认行——离线修复"
+            "可能丢失未归档确认记录而缓存水位停在高位（水位掩盖确认断档），此时"
+            "返回 409（missing_required_acknowledgments，附缺失消费者、序号与预期"
+            "摘要），既不清空任何明细也不推进 archived_through。归档清空目标范围的观测与"
             "阈值明细，批次成为墓碑（status=archived），只保留 batch_id、序号、"
             "前序/本批摘要、条数、首次受理时刻/响应与重放统计；链头摘要与后续"
             "上传不变。重复或更小目标幂等（HTTP 200，status=already_archived）。"
@@ -1053,7 +1061,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "提交序号范围，服务在单个只读 SQLite 事务内固定快照：逐批重算范围内"
             "未归档批次的规范 SHA-256 并与保存摘要比对，核对 previous_digest 链、"
             "序号连续性、batch_count/last_sequence/head_digest、archived_through "
-            "墓碑边界与墓碑骨架、消费者确认摘要与连续水位、连续批次判定来源摘要；"
+            "墓碑边界与墓碑骨架、消费者确认摘要与连续水位、连续批次判定来源摘要，"
+            "并在同一快照内核对每个消费者从归档边界（archived_through，不含）到"
+            "其水位的未归档区间确认连续——离线修复丢失未归档确认记录而缓存水位"
+            "未退时按 ack_missing 逐序号指出缺失消费者、序号与预期（批次摘要）；"
+            "归档之后登记的消费者从 archived_through 起步，先前墓碑不算漏确认。"
             "归档批次只核对保存的摘要与边界。返回快照上限、ok 与问题清单"
             "（issue_code/sequence/expected/actual）。并发上传、确认或归档期间"
             "结果来自同一快照；发现问题不改任何数据。设备无批次或范围内缺批次"
